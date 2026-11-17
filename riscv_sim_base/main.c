@@ -23,6 +23,7 @@ static void usage(const char *prog) {
         "  --hazard <stall|forward>  same as --pipeline / --pipeline-forward\n"
         "  --predict <name>     branch predictor: not-taken | btfn | 1bit | 2bit\n"
         "  --predictor <name>   same as --predict\n"
+        "                       (requires --pipeline-forward)\n"
         "  --max-cycles N       cycle limit for --batch / pipeline modes (default %llu)\n"
         "  --mem-size N         memory size in bytes (default %u)\n",
         prog, (unsigned long long)DEFAULT_MAX_CYCLES, DEFAULT_MEM_SIZE);
@@ -39,21 +40,23 @@ int main(int argc, char **argv) {
     uint64_t max_cycles = DEFAULT_MAX_CYCLES;
     uint32_t mem_size   = DEFAULT_MEM_SIZE;
     BPMode   bp_mode    = BP_NONE;
+    int      no_hazard  = 0;
 
     for (int i = 2; i < argc; i++) {
         if (strcmp(argv[i], "--batch") == 0 ||
             strcmp(argv[i], "--single-cycle") == 0) {
             batch_mode = 1;
         } else if (strcmp(argv[i], "--pipeline") == 0) {
-            batch_mode = 2;
+            batch_mode = 2; no_hazard = 0;
         } else if (strcmp(argv[i], "--pipeline-forward") == 0) {
             batch_mode = 3;
         } else if (strcmp(argv[i], "--hazard") == 0 && i + 1 < argc) {
             const char *hz = argv[++i];
-            if (strcmp(hz, "stall") == 0)        batch_mode = 2;
-            else if (strcmp(hz, "forward") == 0) batch_mode = 3;
+            if (strcmp(hz, "none") == 0)         { batch_mode = 2; no_hazard = 1; }
+            else if (strcmp(hz, "stall") == 0)   { batch_mode = 2; no_hazard = 0; }
+            else if (strcmp(hz, "forward") == 0) { batch_mode = 3; no_hazard = 0; }
             else {
-                fprintf(stderr, "unknown hazard unit '%s' (choices: stall forward)\n", hz);
+                fprintf(stderr, "unknown hazard unit '%s' (choices: none stall forward)\n", hz);
                 usage(argv[0]);
                 return 1;
             }
@@ -116,6 +119,7 @@ int main(int argc, char **argv) {
     if (batch_mode >= 2) {
         Pipeline pipe;
         pipeline_init(&pipe, batch_mode == 3, bp_mode);
+        pipe.no_hazard = no_hazard;
         pipeline_run_batch(&pipe, &cpu, &mem, max_cycles);
     } else if (batch_mode) {
         run_batch(&cpu, &mem, max_cycles);

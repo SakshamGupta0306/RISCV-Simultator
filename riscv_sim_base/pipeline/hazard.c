@@ -21,19 +21,19 @@ int produces(int valid, const ControlSignals *lc, uint32_t rd, uint32_t rs) {
 HazardVerdict hazard_check(const Pipeline *p, const DecodedInstr *d,
                            const ControlSignals *c) {
     HazardVerdict v = {0, 0};
+    if (p->no_hazard) return v;
 
     /* An unused source becomes x0, which produces() already rejects
      * (stops e.g. lui from "reading" junk in its rs1 field). */
     uint32_t s1 = c->uses_rs1 ? d->rs1 : 0;
     uint32_t s2 = c->uses_rs2 ? d->rs2 : 0;
 
-    if (!p->forwarding) {               /* stall on any of 3 latches */
+    if (!p->forwarding) {               /* stall: producer in EX or MEM */
+        if (c->is_system) { s1 = 17; s2 = 10; }   /* ecall reads a7, a0 */
         if (produces(p->id_ex.valid,  &p->id_ex.ctrl,  p->id_ex.instr.rd,  s1) ||
             produces(p->id_ex.valid,  &p->id_ex.ctrl,  p->id_ex.instr.rd,  s2) ||
             produces(p->ex_mem.valid, &p->ex_mem.ctrl, p->ex_mem.instr.rd, s1) ||
-            produces(p->ex_mem.valid, &p->ex_mem.ctrl, p->ex_mem.instr.rd, s2) ||
-            produces(p->mem_wb.valid, &p->mem_wb.ctrl, p->mem_wb.instr.rd, s1) ||
-            produces(p->mem_wb.valid, &p->mem_wb.ctrl, p->mem_wb.instr.rd, s2))
+            produces(p->ex_mem.valid, &p->ex_mem.ctrl, p->ex_mem.instr.rd, s2))
             v.stall = 1;
         return v;
     }

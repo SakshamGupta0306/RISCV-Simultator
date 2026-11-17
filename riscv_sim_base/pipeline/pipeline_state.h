@@ -49,6 +49,7 @@ typedef struct {
     uint32_t                  alu_result;
     uint32_t                  store_val;
     uint32_t                  fault_addr;
+    uint32_t                  sys_a7, sys_a0;   /* ecall args captured in ID (none mode) */
 } EXMEM;
 
 /* MEM/WB latch */
@@ -61,6 +62,7 @@ typedef struct {
     ControlSignals            ctrl;
     uint32_t                  wb_val;
     uint32_t                  fault_addr;
+    uint32_t                  sys_a7, sys_a0;
 } MEMWB;
 
 /* Branch predictor mode selector */
@@ -82,6 +84,7 @@ typedef struct {
     uint64_t cycles, retired, stalls, flushes;
 
     /* Lab 3 */
+    int      no_hazard;         /* --hazard none: no stalls, no forwarding */
     int      forwarding;        /* 0 = stall-only (--pipeline), 1 = --pipeline-forward */
     uint64_t load_use_stalls;   /* subset of stalls: load in EX, consumer in ID       */
     uint64_t fwd_ex;            /* operands taken from EX/MEM.alu_result              */

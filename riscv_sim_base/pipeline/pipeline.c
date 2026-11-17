@@ -150,7 +150,16 @@ CPUStatus pipeline_cycle(Pipeline *p, CPUState *cpu, Memory *mem) {
             uint32_t saved_pc = cpu->pc;
             DecodedInstr ins  = w->instr;
             cpu->pc = w->pc;
+            uint32_t real_a7 = cpu_read_reg(cpu, 17), real_a0 = cpu_read_reg(cpu, 10);
+            if (p->no_hazard) {           /* no interlock: ecall uses what ID read */
+                cpu_write_reg(cpu, 17, w->sys_a7);
+                cpu_write_reg(cpu, 10, w->sys_a0);
+            }
             w->handler->execute(cpu, mem, &ins);
+            if (p->no_hazard) {
+                cpu_write_reg(cpu, 17, real_a7);
+                cpu_write_reg(cpu, 10, real_a0);
+            }
 
             if (cpu->status != CPU_RUNNING) {
                 /* halt: leave cpu->pc = w->pc (the ecall's address) */
@@ -174,6 +183,8 @@ CPUStatus pipeline_cycle(Pipeline *p, CPUState *cpu, Memory *mem) {
         o->instr      = e->instr;
         o->handler    = e->handler;
         o->ctrl       = e->ctrl;
+        o->sys_a7     = e->sys_a7;
+        o->sys_a0     = e->sys_a0;
         o->wb_val     = e->alu_result;
         o->fault_addr = e->fault_addr;
 
@@ -217,6 +228,8 @@ CPUStatus pipeline_cycle(Pipeline *p, CPUState *cpu, Memory *mem) {
         o->ctrl       = x->ctrl;
         o->alu_result = 0;
         o->fault_addr = 0;
+        o->sys_a7     = x->rs1_val;
+        o->sys_a0     = x->rs2_val;
 
         Operands op = forward_operands(p, x);
         nx.fwd_ex  += (uint64_t)op.fwd_ex;
@@ -316,6 +329,10 @@ CPUStatus pipeline_cycle(Pipeline *p, CPUState *cpu, Memory *mem) {
                     o->ctrl    = c;
                     o->rs1_val = cpu_read_reg(cpu, (int)d.rs1);
                     o->rs2_val = cpu_read_reg(cpu, (int)d.rs2);
+                    if (c.is_system) {            /* ecall reads a7, a0 in ID */
+                        o->rs1_val = cpu_read_reg(cpu, 17);
+                        o->rs2_val = cpu_read_reg(cpu, 10);
+                    }
                 }
             }
         }
@@ -464,8 +481,8 @@ void pipeline_run_batch(Pipeline *p, CPUState *cpu, Memory *mem, uint64_t max_cy
 
     /* Determine mode string */
     const char *hazard_label;
-    if (!p->forwarding && p->bp_mode == BP_NONE)
-        hazard_label = NULL;    /* Lab 2: "no hazard handling" */
+    if (p->no_hazard)
+        hazard_label = "none";
     else if (!p->forwarding)
         hazard_label = "stall";
     else
