@@ -8,24 +8,29 @@
 #include "rv32i_base.h"
 #include "assembler.h"
 #include "cli_display.h"
+#include "sim_engine.h"
 #include "pipeline_state.h"
 
 #define DEFAULT_MEM_SIZE   (1u << 20)   /* 1 MB */
 #define DEFAULT_MAX_CYCLES 1000000ull
 
+enum { HZ_UNSET = -1, HZ_NONE = 0, HZ_STALL = 1, HZ_FORWARD = 2 };
+
 static void usage(const char *prog) {
     fprintf(stderr,
         "usage: %s <program.s> [options]\n"
-        "  --batch              run to completion with no interaction, then dump state\n"
-        "  --single-cycle       same as --batch (single-cycle oracle)\n"
-        "  --pipeline           like --batch, but on the 5-stage pipeline (stall-only)\n"
-        "  --pipeline-forward   like --pipeline, but with forwarding + load-use detection\n"
-        "  --hazard <stall|forward>  same as --pipeline / --pipeline-forward\n"
-        "  --predict <name>     branch predictor: not-taken | btfn | 1bit | 2bit\n"
-        "  --predictor <name>   same as --predict\n"
-        "                       (requires --pipeline-forward)\n"
-        "  --max-cycles N       cycle limit for --batch / pipeline modes (default %llu)\n"
-        "  --mem-size N         memory size in bytes (default %u)\n",
+        "  (no mode option)           interactive debugger on the default pipeline\n"
+        "  --batch                    run to completion, then dump state\n"
+        "  --single-cycle             use the single-cycle oracle engine\n"
+        "  --hazard none|stall|forward  pipeline hazard unit\n"
+        "  --predictor <name>         not-taken | btfn | 1bit | 2bit  (alias: --predict)\n"
+        "  --pipeline                 same as --hazard stall (no predictor)\n"
+        "  --pipeline-forward         same as --hazard forward (no predictor)\n"
+        "  --trace                    print one line per cycle (pipeline stages)\n"
+        "  --max-cycles N             cycle limit (default %llu)\n"
+        "  --mem-size N               memory size in bytes (default %u)\n"
+        "Defaults: with no --hazard/--predictor, the pipeline runs with\n"
+        "          --hazard forward --predictor 2bit.\n",
         prog, (unsigned long long)DEFAULT_MAX_CYCLES, DEFAULT_MEM_SIZE);
 }
 
@@ -36,34 +41,41 @@ int main(int argc, char **argv) {
     }
 
     const char *program_path = argv[1];
-    int      batch_mode = 0;
+    int      batch      = 0;      /* run non-interactively                      */
+    int      single     = 0;      /* --single-cycle                             */
+    int      trace      = 0;
+    int      hazard     = HZ_UNSET;
+    int      bp_given   = 0;
+    BPMode   bp_mode    = BP_NONE;
     uint64_t max_cycles = DEFAULT_MAX_CYCLES;
     uint32_t mem_size   = DEFAULT_MEM_SIZE;
-    BPMode   bp_mode    = BP_NONE;
-    int      no_hazard  = 0;
 
     for (int i = 2; i < argc; i++) {
-        if (strcmp(argv[i], "--batch") == 0 ||
-            strcmp(argv[i], "--single-cycle") == 0) {
-            batch_mode = 1;
-        } else if (strcmp(argv[i], "--pipeline") == 0) {
-            batch_mode = 2; no_hazard = 0;
-        } else if (strcmp(argv[i], "--pipeline-forward") == 0) {
-            batch_mode = 3;
-        } else if (strcmp(argv[i], "--hazard") == 0 && i + 1 < argc) {
+        const char *a = argv[i];
+        if (strcmp(a, "--batch") == 0) {
+            batch = 1;
+        } else if (strcmp(a, "--single-cycle") == 0) {
+            single = 1; batch = 1;
+        } else if (strcmp(a, "--trace") == 0) {
+            trace = 1;
+        } else if (strcmp(a, "--pipeline") == 0) {
+            hazard = HZ_STALL; batch = 1;
+        } else if (strcmp(a, "--pipeline-forward") == 0) {
+            hazard = HZ_FORWARD; batch = 1;
+        } else if (strcmp(a, "--hazard") == 0 && i + 1 < argc) {
             const char *hz = argv[++i];
-            if (strcmp(hz, "none") == 0)         { batch_mode = 2; no_hazard = 1; }
-            else if (strcmp(hz, "stall") == 0)   { batch_mode = 2; no_hazard = 0; }
-            else if (strcmp(hz, "forward") == 0) { batch_mode = 3; no_hazard = 0; }
+            if      (strcmp(hz, "none") == 0)    hazard = HZ_NONE;
+            else if (strcmp(hz, "stall") == 0)   hazard = HZ_STALL;
+            else if (strcmp(hz, "forward") == 0) hazard = HZ_FORWARD;
             else {
                 fprintf(stderr, "unknown hazard unit '%s' (choices: none stall forward)\n", hz);
                 usage(argv[0]);
                 return 1;
             }
-        } else if ((strcmp(argv[i], "--predict") == 0 ||
-                    strcmp(argv[i], "--predictor") == 0) && i + 1 < argc) {
+            batch = 1;
+        } else if ((strcmp(a, "--predict") == 0 || strcmp(a, "--predictor") == 0) && i + 1 < argc) {
             const char *name = argv[++i];
-            if (strcmp(name, "not-taken") == 0)      bp_mode = BP_NOT_TAKEN;
+            if      (strcmp(name, "not-taken") == 0) bp_mode = BP_NOT_TAKEN;
             else if (strcmp(name, "btfn") == 0)      bp_mode = BP_BTFN;
             else if (strcmp(name, "1bit") == 0)      bp_mode = BP_1BIT;
             else if (strcmp(name, "2bit") == 0)      bp_mode = BP_2BIT;
@@ -72,20 +84,23 @@ int main(int argc, char **argv) {
                 usage(argv[0]);
                 return 1;
             }
-        } else if (strcmp(argv[i], "--max-cycles") == 0 && i + 1 < argc) {
+            bp_given = 1; batch = 1;
+        } else if (strcmp(a, "--max-cycles") == 0 && i + 1 < argc) {
             max_cycles = strtoull(argv[++i], NULL, 0);
-        } else if (strcmp(argv[i], "--mem-size") == 0 && i + 1 < argc) {
+        } else if (strcmp(a, "--mem-size") == 0 && i + 1 < argc) {
             mem_size = (uint32_t)strtoul(argv[++i], NULL, 0);
         } else {
-            fprintf(stderr, "unrecognized option '%s'\n", argv[i]);
+            fprintf(stderr, "unrecognized option '%s'\n", a);
             usage(argv[0]);
             return 1;
         }
     }
 
-    if (bp_mode != BP_NONE && batch_mode != 3) {
-        fprintf(stderr, "warning: --predict requires --pipeline-forward; enabling it.\n");
-        batch_mode = 3;
+    /* Defaults. Nothing chosen at all -> forward + 2bit. A predictor alone
+     * implies forwarding. A hazard unit alone means "no predictor". */
+    if (hazard == HZ_UNSET) {
+        hazard = HZ_FORWARD;
+        if (!bp_given) bp_mode = BP_2BIT;
     }
 
     /* 1. Bring up the ISA. */
@@ -112,20 +127,22 @@ int main(int argc, char **argv) {
 
     printf("assembled '%s' ok. entry point = 0x%08x\n", program_path, entry_point);
 
-    /* 3. Reset the CPU and run. */
+    /* 3. Reset the CPU, pick the engine, run. */
     CPUState cpu;
     cpu_reset(&cpu, entry_point);
 
-    if (batch_mode >= 2) {
-        Pipeline pipe;
-        pipeline_init(&pipe, batch_mode == 3, bp_mode);
-        pipe.no_hazard = no_hazard;
-        pipeline_run_batch(&pipe, &cpu, &mem, max_cycles);
-    } else if (batch_mode) {
-        run_batch(&cpu, &mem, max_cycles);
+    SimEngine eng;
+    Pipeline  pipe;
+    if (single) {
+        sim_engine_init_single(&eng, &cpu, &mem);
     } else {
-        run_repl(&cpu, &mem);
+        pipeline_init(&pipe, hazard == HZ_FORWARD, bp_mode);
+        pipe.no_hazard = (hazard == HZ_NONE);
+        pipeline_engine_init(&eng, &pipe, &cpu, &mem);
     }
+
+    if (batch) run_batch(&eng, max_cycles, trace);
+    else       run_repl(&eng);
 
     memory_free(&mem);
     return 0;

@@ -1,6 +1,6 @@
 CC      := gcc
 CFLAGS  := -std=c11 -Wall -Wextra -g -O0 \
-           -Icore -Iisa -Iassembler -Iui -Ipipeline
+           -MMD -MP -Icore -Iisa -Iassembler -Iui -Ipipeline
 LDFLAGS :=
 
 BIN := rvsim
@@ -11,6 +11,7 @@ SRCS := \
 	core/isa_registry.c \
 	core/decoder.c \
 	core/executor.c \
+	core/sim_engine.c \
 	isa/rv32i_base.c \
 	assembler/assembler.c \
 	ui/cli_display.c \
@@ -19,6 +20,7 @@ SRCS := \
 	main.c
 
 OBJS := $(SRCS:.c=.o)
+DEPS := $(OBJS:.o=.d)
 
 .PHONY: all clean run memcheck test
 
@@ -46,5 +48,7 @@ test: $(BIN)
 		echo; \
 	done
 
+-include $(DEPS)
+
 clean:
-	rm -f $(OBJS) $(BIN)
+	rm -f $(OBJS) $(DEPS) $(BIN)

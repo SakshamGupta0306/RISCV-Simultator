@@ -6,6 +6,7 @@
 #include "memory.h"         /* Memory, MemStatus   */
 #include "decoder.h"        /* DecodedInstr, InstructionHandler, decode_instruction */
 #include "control.h"        /* ControlSignals */
+#include "sim_engine.h"     /* SimEngine */
 
 /* Precise-exception fault codes, carried down the pipe and raised only at WB */
 #define PF_NONE    0
@@ -103,7 +104,8 @@ typedef struct {
 
 void      pipeline_init      (Pipeline *p, int forwarding, BPMode bp_mode);
 CPUStatus pipeline_cycle     (Pipeline *p, CPUState *cpu, Memory *mem);
-void      pipeline_run_batch (Pipeline *p, CPUState *cpu, Memory *mem, uint64_t max_cycles);
+/* Wraps a Pipeline as a SimEngine so the UI can run/step/trace it. */
+void      pipeline_engine_init(SimEngine *e, Pipeline *p, CPUState *cpu, Memory *mem);
 
 /* Branch predictor helpers (called by pipeline.c) */
 int      bp_predict  (Pipeline *p, uint32_t pc, int32_t imm);   /* 1=predict taken */

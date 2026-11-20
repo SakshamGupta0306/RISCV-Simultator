@@ -26,7 +26,7 @@
 
 #include "pipeline_state.h"
 #include "hazard.h"
-#include "cli_display.h"
+#include "sim_engine.h"
 
 /* ------------------------------------------------------------------ */
 /* ALU                                                                 */
@@ -139,6 +139,7 @@ CPUStatus pipeline_cycle(Pipeline *p, CPUState *cpu, Memory *mem) {
                          "data access out of bounds at addr=0x%08x (pc=0x%08x)",
                          w->fault_addr, w->pc);
             }
+            cpu->pc = w->pc;     /* precise exception: pc of the faulting instruction */
             p->cycles++;
             return cpu->status;
         }
@@ -438,92 +439,67 @@ CPUStatus pipeline_cycle(Pipeline *p, CPUState *cpu, Memory *mem) {
     return cpu->status;
 }
 
-void pipeline_run_batch(Pipeline *p, CPUState *cpu, Memory *mem, uint64_t max_cycles) {
-    while (cpu->status == CPU_RUNNING && p->cycles < max_cycles)
-        pipeline_cycle(p, cpu, mem);
+/* ----------------------------------------------------------------------
+ * Statistics text, in the exact reference format (one "name = value" per
+ * line). Which lines appear depends on the mode, as in the expected files:
+ *   always         : retired, CPI, stalls, forwards, redirects, squashed
+ *   predictor      : + branches, mispredicts, accuracy, jal, jalr
+ * ---------------------------------------------------------------------- */
+static void pipeline_format_stats(const SimEngine *e, char *buf, size_t size) {
+    const Pipeline *p = (const Pipeline *)e->impl;
+    size_t n = 0;
+#define EMIT(...) do { if (n < size) n += (size_t)snprintf(buf + n, size - n, __VA_ARGS__); } while (0)
 
-    cpu->cycle_count = p->cycles;
+    const char *hz = p->no_hazard ? "none" : (p->forwarding ? "forward" : "stall");
+    const char *pr = bp_name(p->bp_mode);            /* NULL for BP_NONE */
 
-    printf("\n");
-    print_registers(cpu);
-    print_status(cpu);
-    if (cpu->status == CPU_RUNNING)
-        printf("  -> stopped: reached max cycle limit (%llu)\n",
-               (unsigned long long)max_cycles);
+    if (!pr)           EMIT("pipeline        = 5-stage, hazard unit '%s'\n", hz);
+    else               EMIT("pipeline        = 5-stage, hazard unit '%s', predictor '%s'\n", hz, pr);
 
-    /* ----------------------------------------------------------------
-     * Output format matching the expected golden files.
-     *
-     * Lab 2 (--pipeline, no hazard handling):
-     *   pipeline        = 5-stage, no hazard handling
-     *   retired         = N
-     *   CPI             = X.XXX
-     *   redirects       = N
-     *   squashed        = N
-     *
-     * Lab 3 (--pipeline / --pipeline-forward with hazard unit):
-     *   pipeline        = 5-stage, hazard unit 'stall'|'forward'
-     *   retired         = N
-     *   CPI             = X.XXX
-     *   stalls          = N
-     *   forwards        = N
-     *   redirects       = N
-     *   squashed        = N
-     *
-     * Lab 4 (--pipeline-forward --predict <name>):
-     *   adds:
-     *   branches        = N
-     *   mispredicts     = N
-     *   accuracy        = XX.X%
-     *   jal             = N
-     *   jalr            = N
-     * ---------------------------------------------------------------- */
+    EMIT("retired         = %llu\n", (unsigned long long)p->retired);
+    EMIT("CPI             = %.3f\n", p->retired ? (double)p->cycles / (double)p->retired : 0.0);
 
-    /* Determine mode string */
-    const char *hazard_label;
-    if (p->no_hazard)
-        hazard_label = "none";
-    else if (!p->forwarding)
-        hazard_label = "stall";
-    else
-        hazard_label = "forward";
-
-    const char *pred_label = bp_name(p->bp_mode);  /* NULL for BP_NONE */
-
-    /* Build the pipeline description string */
-    if (hazard_label == NULL) {
-        printf("pipeline        = 5-stage, no hazard handling\n");
-    } else if (pred_label == NULL) {
-        printf("pipeline        = 5-stage, hazard unit '%s'\n", hazard_label);
-    } else {
-        printf("pipeline        = 5-stage, hazard unit '%s', predictor '%s'\n",
-               hazard_label, pred_label);
+    EMIT("stalls          = %llu\n", (unsigned long long)p->stalls);
+    EMIT("forwards        = %llu\n", (unsigned long long)(p->fwd_ex + p->fwd_mem));
+    if (pr) {
+        double acc = p->branches ? 100.0 * (double)(p->branches - p->mispredicts) / (double)p->branches : 0.0;
+        EMIT("branches        = %llu\n", (unsigned long long)p->branches);
+        EMIT("mispredicts     = %llu\n", (unsigned long long)p->mispredicts);
+        EMIT("accuracy        = %.1f%%\n", acc);
+        EMIT("jal             = %llu\n", (unsigned long long)p->jal_count);
+        EMIT("jalr            = %llu\n", (unsigned long long)p->jalr_count);
     }
+    EMIT("redirects       = %llu\n", (unsigned long long)p->redirects);
+    EMIT("squashed        = %llu\n", (unsigned long long)p->squashed);
+#undef EMIT
+}
 
-    printf("retired         = %llu\n", (unsigned long long)p->retired);
-    printf("CPI             = %.3f\n",
-           p->retired ? (double)p->cycles / (double)p->retired : 0.0);
+/* ---------------------------------------------------------------------- *
+ * SimEngine glue: lets the UI drive the pipeline one clock at a time.
+ * ---------------------------------------------------------------------- */
+static void pipeline_engine_step(SimEngine *e) {
+    Pipeline *p = (Pipeline *)e->impl;
+    pipeline_cycle(p, e->cpu, e->mem);
+    e->cpu->cycle_count = p->cycles;
+}
 
-    /* Stalls line: only when hazard unit is active */
-    if (hazard_label != NULL)
-        printf("stalls          = %llu\n", (unsigned long long)p->stalls);
+static int pipeline_engine_stage_views(const SimEngine *e, PipelineStageView *v, int max) {
+    const Pipeline *p = (const Pipeline *)e->impl;
+    if (max < 5) return 0;
+    v[0].label = "IF";  v[0].pc = e->cpu->pc;    v[0].is_bubble = (e->cpu->status != CPU_RUNNING);
+    v[1].label = "ID";  v[1].pc = p->if_id.pc;   v[1].is_bubble = !p->if_id.valid;
+    v[2].label = "EX";  v[2].pc = p->id_ex.pc;   v[2].is_bubble = !p->id_ex.valid;
+    v[3].label = "MEM"; v[3].pc = p->ex_mem.pc;  v[3].is_bubble = !p->ex_mem.valid;
+    v[4].label = "WB";  v[4].pc = p->mem_wb.pc;  v[4].is_bubble = !p->mem_wb.valid;
+    return 5;
+}
 
-    /* Forwards line: always present when hazard unit active */
-    if (hazard_label != NULL)
-        printf("forwards        = %llu\n", (unsigned long long)p->fwd_ex + p->fwd_mem);
-
-    /* Lab 4 extra stats */
-    if (pred_label != NULL) {
-        double accuracy = p->branches > 0
-            ? 100.0 * (double)(p->branches - p->mispredicts) / (double)p->branches
-            : 0.0;
-        printf("branches        = %llu\n", (unsigned long long)p->branches);
-        printf("mispredicts     = %llu\n", (unsigned long long)p->mispredicts);
-        printf("accuracy        = %.1f%%\n", accuracy);
-        printf("jal             = %llu\n", (unsigned long long)p->jal_count);
-        printf("jalr            = %llu\n", (unsigned long long)p->jalr_count);
-    }
-
-    printf("redirects       = %llu\n", (unsigned long long)p->redirects);
-    printf("squashed        = %llu\n", (unsigned long long)p->squashed);
+void pipeline_engine_init(SimEngine *e, Pipeline *p, CPUState *cpu, Memory *mem) {
+    e->name         = "5-stage pipeline";
+    e->cpu          = cpu;
+    e->mem          = mem;
+    e->impl         = p;
+    e->step         = pipeline_engine_step;
+    e->stage_views  = pipeline_engine_stage_views;
+    e->format_stats = pipeline_format_stats;
 }
